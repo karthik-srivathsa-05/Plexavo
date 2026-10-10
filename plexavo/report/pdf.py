@@ -77,6 +77,14 @@ class _ReportPDF(FPDF):
         # occur in real text, rather than an empty string (which broke
         # fpdf2's internal parser in testing).
         self.MARKDOWN_UNDERLINE_MARKER = "\x01\x01\x01"
+        # fpdf2 2.8.9+ also snapshots every marker into a class-level tuple when the
+        # class is defined, and splits on that tuple, so overriding the single
+        # attribute above is no longer enough. Rebuild the tuple too. Older
+        # fpdf2 has no such tuple, hence the hasattr guard.
+        if hasattr(self, "MARKDOWN_MARKERS"):
+            self.MARKDOWN_MARKERS = tuple(
+                self.MARKDOWN_UNDERLINE_MARKER if m == "--" else m for m in self.MARKDOWN_MARKERS
+            )
 
     def header(self):
         if self.page_no() == 1:
