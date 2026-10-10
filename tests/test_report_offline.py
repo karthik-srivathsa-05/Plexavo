@@ -220,5 +220,59 @@ omitted_html = generate_html(omitted_data)
 assert_true("No attack chains were identified in this scan" in omitted_html, "Omitting chains= renders the same empty state as chains=[]")
 assert_true(_balanced_divs(omitted_html), "Rendered HTML has balanced <div>/</div> tags with chains= omitted")
 
+print("\n=== EC2-32: the free template fix survives into the HTML report (Important tab AND All Findings tab) ===")
+from plexavo.report.ai_narration import explain_finding
+
+EC2_ID = "i-0abc1234def567890"
+ec2_finding = Finding(
+    check_id="EC2-32", title="IMDSv2 Not Enforced", severity=Severity.CRITICAL, resource_arn=EC2_ID,
+    raw_detail="EC2 instance 'web' accepts IMDSv1.", account_context="iam_role_attached=True, region=ap-south-1",
+    evidence="http_tokens=optional, iam_role_attached=True",
+)
+ec2_expl = explain_finding(ec2_finding, use_ai=False)  # template path, no client, no network
+assert_true(ec2_expl is not None and ec2_expl.source == "template", "EC2-32 is explained by the free template with AI narration off")
+ec2_chain = AttackChain(chain_id="path-1", template="ec2-role-s3", nodes=[
+    ChainNode(kind="internet", title="Internet", detail="Unauthenticated, from anywhere", resource_id="internet"),
+    ChainNode(kind="ec2", title="EC2 instance", detail=f"{EC2_ID} - reachable", resource_id=EC2_ID,
+              finding_resource_arn=EC2_ID),
+])
+ec2_data = build_report_data([ec2_finding], calculate_score([ec2_finding]), "111111111111", [ec2_expl], chains=[ec2_chain])
+ec2_html = generate_html(ec2_data)
+ec2_cmd = f"aws ec2 modify-instance-metadata-options --instance-id {EC2_ID} --http-tokens required --http-endpoint enabled --region ap-south-1"
+important_start = ec2_html.index('<div class="tab-panel" data-tab-panel="important"')
+all_start = ec2_html.index('<div class="tab-panel" data-tab-panel="all"')
+important_panel = ec2_html[important_start:all_start]
+all_panel = ec2_html[all_start:]
+assert_true(len(ec2_data["important_cards"]) == 1 and ec2_data["important_cards"][0]["check_id"] == "EC2-32",
+            "The EC2 chain node is backed by the real EC2-32 finding, so the Important tab shows its card")
+for tab, panel in (("Important", important_panel), ("All Findings", all_panel)):
+    assert_true(ec2_cmd in panel, f"{tab} tab contains the full EC2-32 command with the real instance id and region")
+    assert_true(panel.count(ec2_cmd) == 2, f"{tab} tab shows the command in both Next step and Full fix detail")
+    assert_true("MetadataNoToken" in panel and "--http-put-response-hop-limit 2" in panel,
+                f"{tab} tab shows the full fix detail, not just the one-liner")
+    assert_true("Next step" in panel and "Full fix detail" in panel, f"{tab} tab renders the explained layout (Next step + Full fix detail)")
+assert_true(_balanced_divs(ec2_html), "EC2-32 report has balanced <div>/</div> tags")
+
+# Same finding, no region known: the HTML must show the command without --region, never a placeholder.
+no_region = Finding(
+    check_id="EC2-32", title="IMDSv2 Not Enforced", severity=Severity.MEDIUM, resource_arn=EC2_ID,
+    raw_detail="x", account_context="iam_role_attached=False", evidence="http_tokens=optional, iam_role_attached=False",
+)
+nr_html = generate_html(build_report_data([no_region], calculate_score([no_region]), "111111111111",
+                                          [explain_finding(no_region, use_ai=False)]))
+assert_true(f"--instance-id {EC2_ID} --http-tokens required --http-endpoint enabled" in nr_html and "--region" not in nr_html,
+            "No-region EC2-32 renders the command with no --region and no placeholder")
+
+print("\n=== EC2-32: the template fix survives full PDF generation too ===")
+pdf_data = build_report_data([ec2_finding], calculate_score([ec2_finding]), "111111111111", [ec2_expl])
+with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+    generate_pdf(pdf_data, tmp.name)
+    pdf_text = "".join(p.extract_text() for p in PdfReader(tmp.name).pages)
+os.unlink(tmp.name)
+pdf_flat = re.sub(r"\s+", "", pdf_text)  # long monospace lines wrap, so compare with whitespace removed
+assert_true(re.sub(r"\s+", "", ec2_cmd) in pdf_flat, "PDF contains the full EC2-32 command intact (flags not eaten by the underline marker)")
+assert_true("MetadataNoToken" in pdf_flat, "PDF contains the full fix detail")
+assert_true("**" not in pdf_text, "No stray ** in the EC2-32 PDF")
+
 print(f"\n{'ALL PASSED' if failures == 0 else f'{failures} FAILURE(S)'}")
 sys.exit(1 if failures else 0)

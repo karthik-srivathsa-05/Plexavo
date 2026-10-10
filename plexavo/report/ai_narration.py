@@ -172,7 +172,7 @@ def _parse_sections(raw_text: str) -> tuple[str, str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Templates for the 11 most common, narratively-generic check types.
+# Templates for the most common, narratively-generic check types.
 # Every specific fact (resource names, chain targets) already lives in
 # the Finding's own fields, computed deterministically in Python — the
 # template just substitutes them into fixed prose matching the same
@@ -398,6 +398,61 @@ def _template_log25(f: Finding) -> Explanation:
     )
 
 
+def _template_ec2_32(f: Finding) -> Explanation:
+    # EC2-32's resource_arn is the bare instance id (e.g. i-0abc123). Role
+    # attachment and region ride on account_context ("iam_role_attached=True,
+    # region=ap-south-1"). Region is absent when the session had none, in
+    # which case --region is omitted rather than filled with a placeholder.
+    instance_id = f.resource_arn
+    region_match = re.search(r"region=([a-z0-9-]+)", f.account_context)
+    region_flag = f" --region {region_match.group(1)}" if region_match else ""
+    role_match = re.search(r"iam_role_attached=(True|False)", f.account_context)
+
+    impact = (
+        f"Instance '{instance_id}' still accepts IMDSv1 requests to the instance metadata service. IMDSv1 "
+        f"answers any plain HTTP GET to 169.254.169.254 with no session token, so anything that can make "
+        f"the instance send a request (the classic case is an SSRF bug in an application running on it) "
+        f"can read metadata from it. IMDSv2 requires a session token obtained with a PUT request first, "
+        f"which defeats the common SSRF and open-proxy paths. It does not protect against an attacker who "
+        f"already has code execution on the instance."
+    )
+    if role_match and role_match.group(1) == "True":
+        impact += (
+            " This instance has an IAM role attached, so an attacker who can reach the metadata service "
+            "can call iam/security-credentials/ and retrieve that role's temporary credentials, then use "
+            "them against whatever the role allows. This is the chain used in the 2019 Capital One breach."
+        )
+    elif role_match:
+        impact += (
+            " No IAM role is attached, so there are no AWS credentials to steal here, but the metadata "
+            "service can still expose the instance identity document and anything left in user-data."
+        )
+
+    command = (
+        f"aws ec2 modify-instance-metadata-options --instance-id {instance_id} "
+        f"--http-tokens required --http-endpoint enabled{region_flag}"
+    )
+    return Explanation(
+        impact=impact,
+        how_to_fix=(
+            f"1. Require IMDSv2 on this instance:\n{command}\n"
+            "2. Check before applying. Anything on the instance that still uses IMDSv1 (old SDKs, old agents, "
+            "custom scripts) will fail to fetch credentials after this change. Check the CloudWatch metric "
+            "MetadataNoToken for this instance in the AWS/EC2 namespace first. A value above zero means "
+            "something is still calling IMDSv1.\n"
+            "3. Containers running on the instance may need a larger hop limit. If they cannot reach the "
+            "metadata service after the change, add --http-put-response-hop-limit 2.\n"
+            "4. If this instance is managed by Terraform or CloudFormation, change the setting in code "
+            'instead (Terraform: metadata_options { http_tokens = "required" }), otherwise the next apply '
+            "or stack update will revert the CLI change.\n"
+            "5. The change takes effect immediately without a reboot, and can be reverted by setting "
+            "--http-tokens optional."
+        ),
+        next_step=f"Require IMDSv2 on this instance: {command}",
+        source="template",
+    )
+
+
 COMMON_CHECK_TEMPLATES = {
     "IAM-01": _template_iam01,
     "IAM-06": _template_iam06,
@@ -410,18 +465,19 @@ COMMON_CHECK_TEMPLATES = {
     "STOR-19": _template_stor19,
     "ENC-29": _template_enc29,
     "LOG-25": _template_log25,
+    "EC2-32": _template_ec2_32,
 }
 
 
 def explain_finding(finding: Finding, client=None, use_ai: bool = False) -> Explanation | None:
     """use_ai=False (default): route to the free template (zero API cost,
-    zero network) for the 11 most common, narratively-generic check
+    zero network) for the most common, narratively-generic check
     types; every other check returns None (raw finding detail only — no
     API call is ever attempted in this mode, regardless of whether a key
     is configured). This is the always-on baseline — no flag needed to
     get free remediation guidance where a template exists.
 
-    use_ai=True: every finding, including the 11 templated ones, is sent
+    use_ai=True: every finding, including the templated ones, is sent
     to Claude instead — deliberately bypasses the template shortcut so
     "AI narration on" always means fully AI-written content, never a mix
     of template and AI.

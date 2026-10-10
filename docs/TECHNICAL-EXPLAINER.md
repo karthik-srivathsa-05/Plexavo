@@ -138,7 +138,7 @@ plausible-looking threshold.
 
 ### Cost control: templates vs. API
 
-11 of the most common, narratively-generic finding types
+The most common, narratively-generic finding types
 (`COMMON_CHECK_TEMPLATES`) are hand-written Python f-strings —
 zero API cost, zero latency. Everything else calls Claude
 (`claude-sonnet-5`). This is the blueprint's own stated cost strategy,

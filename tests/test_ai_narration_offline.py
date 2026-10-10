@@ -4,6 +4,7 @@ file — the "API path" tests use a fake Anthropic-shaped client.
 Run: python test_explainer_offline.py
 """
 
+import re
 import sys
 from plexavo.findings import Finding, Severity
 from plexavo.report.ai_narration import (
@@ -73,7 +74,7 @@ assert_true(_short_name("arn:aws:iam::111111111111:role/my-role") == "my-role", 
 assert_true(_short_name("arn:aws:s3:::my-bucket") == "my-bucket", "Extracts name after last : when no /")
 assert_true(_short_name("i-0abc123") == "i-0abc123", "Bare ID with no separators returned as-is")
 
-print("\n=== All 11 templates produce non-empty impact/next_step, with ZERO API contact ===")
+print("\n=== Every template produces non-empty impact/next_step, with ZERO API contact ===")
 for check_id in COMMON_CHECK_TEMPLATES:
     finding = f(check_id)
     result = explain_finding(finding, client=ExplodingClient())
@@ -81,7 +82,12 @@ for check_id in COMMON_CHECK_TEMPLATES:
     assert_true(bool(result.impact.strip()), f"{check_id} impact is non-empty")
     assert_true(bool(result.how_to_fix.strip()), f"{check_id} how_to_fix is non-empty")
     assert_true(bool(result.next_step.strip()), f"{check_id} next_step is non-empty — this is new, every template must set it")
-assert_true(len(COMMON_CHECK_TEMPLATES) == 11, f"Exactly 11 templated checks exist (got {len(COMMON_CHECK_TEMPLATES)})")
+EXPECTED_TEMPLATE_IDS = {
+    "IAM-01", "IAM-06", "IAM-09", "IAM-10", "IAM-11", "IAM-13",
+    "NET-01", "NET-02", "STOR-19", "ENC-29", "LOG-25", "EC2-32",
+}
+assert_true(set(COMMON_CHECK_TEMPLATES) == EXPECTED_TEMPLATE_IDS,
+            f"Templated check ids are exactly the expected set (got {sorted(COMMON_CHECK_TEMPLATES)})")
 
 print("\n=== LOG-25 (GuardDuty): account-level finding, template does not depend on a resource name ===")
 # LOG-25's real finding has resource_arn="account" — no per-resource
@@ -94,6 +100,82 @@ assert_true("guardduty create-detector" in result.how_to_fix, "LOG-25 fix names 
 assert_true("guardduty create-detector" in result.next_step, "LOG-25 next_step names the actual enable command")
 assert_true("<PLACEHOLDER" not in result.how_to_fix and "<PLACEHOLDER" not in result.next_step,
             "LOG-25 has no per-resource value to fill, so no placeholder should appear")
+
+print("\n=== EC2-32 (IMDSv2): instance id and region come from the Finding, no placeholders ===")
+EC2_ID = "i-0abc1234def567890"
+EC2_CMD = "modify-instance-metadata-options"
+finding = f("EC2-32", resource_arn=EC2_ID, account_context="iam_role_attached=True, region=ap-south-1")
+result = explain_finding(finding, client=ExplodingClient())
+assert_true(result.source == "template", f"EC2-32 routes to template with zero API contact (got source={result.source})")
+for label, text in (("next_step", result.next_step), ("how_to_fix", result.how_to_fix)):
+    assert_true(EC2_ID in text, f"EC2-32 {label} contains the real instance id")
+    assert_true(EC2_CMD in text, f"EC2-32 {label} names modify-instance-metadata-options")
+    assert_true("--http-tokens required" in text, f"EC2-32 {label} sets --http-tokens required")
+    assert_true("--region ap-south-1" in text, f"EC2-32 {label} carries the region from account_context")
+assert_true(result.next_step.count("aws ec2 ") == 1, "EC2-32 next_step holds exactly one command")
+ec2_cmd_line = result.next_step.split(": ", 1)[1]
+assert_true(ec2_cmd_line in result.how_to_fix,
+            "EC2-32 next_step command is character-for-character the command in how_to_fix")
+assert_true(f"Instance '{EC2_ID}'" in result.impact, "EC2-32 impact names the real instance id")
+
+print("\n=== EC2-32: no region in account_context -> --region omitted entirely, no placeholder ===")
+finding = f("EC2-32", resource_arn=EC2_ID, account_context="iam_role_attached=True")
+result = explain_finding(finding, client=ExplodingClient())
+assert_true("--region" not in result.next_step, "EC2-32 next_step has no --region when the region is unknown")
+assert_true("--region" not in result.how_to_fix, "EC2-32 how_to_fix has no --region when the region is unknown")
+assert_true(EC2_ID in result.next_step and "--http-tokens required" in result.next_step,
+            "EC2-32 without a region still produces the full command")
+assert_true(result.next_step.split(": ", 1)[1] in result.how_to_fix,
+            "EC2-32 next_step command still matches how_to_fix without a region")
+
+print("\n=== EC2-32: no unfilled placeholders in any field, in any account_context variant ===")
+for ctx in ("iam_role_attached=True, region=ap-south-1", "iam_role_attached=False", "x", ""):
+    finding = f("EC2-32", resource_arn=EC2_ID, account_context=ctx)
+    result = explain_finding(finding, client=ExplodingClient())
+    for label, text in (("impact", result.impact), ("next_step", result.next_step), ("how_to_fix", result.how_to_fix)):
+        # Match the placeholder token shape (<PLACEHOLDER-X>, <INSTANCE_ID>, <region>) rather than any
+        # bare "<" or ">", so legitimate comparison text could never false-fail this check.
+        assert_true(re.search(r"<[A-Za-z][A-Za-z0-9_-]*>", text) is None
+                    and "<PLACEHOLDER" not in text and "<INSTANCE" not in text,
+                    f"EC2-32 {label} has no unfilled placeholder (account_context={ctx!r})")
+
+print("\n=== EC2-32: role sentence follows iam_role_attached, falls back to generic text when absent ===")
+with_role = explain_finding(
+    f("EC2-32", resource_arn=EC2_ID, account_context="iam_role_attached=True, region=ap-south-1"),
+    client=ExplodingClient())
+no_role = explain_finding(
+    f("EC2-32", resource_arn=EC2_ID, account_context="iam_role_attached=False, region=ap-south-1"),
+    client=ExplodingClient())
+missing_key = explain_finding(f("EC2-32", resource_arn=EC2_ID, account_context="x"), client=ExplodingClient())
+assert_true("credentials" in with_role.impact and "security-credentials" in with_role.impact,
+            "Role-attached impact explains the credential theft path")
+assert_true("Capital One" in with_role.impact, "Role-attached impact names the Capital One precedent")
+assert_true("Capital One" not in no_role.impact, "No-role impact does not claim the Capital One chain")
+assert_true("No IAM role is attached" in no_role.impact and "user-data" in no_role.impact,
+            "No-role impact states no role is attached and names the remaining exposure")
+assert_true("Capital One" not in missing_key.impact and "IAM role" not in missing_key.impact,
+            "Missing iam_role_attached key -> generic text, no role sentence either way")
+assert_true(missing_key.impact.startswith(f"Instance '{EC2_ID}' still accepts IMDSv1"),
+            "Generic impact still carries the base paragraph")
+assert_true(with_role.impact.startswith(missing_key.impact) and no_role.impact.startswith(missing_key.impact),
+            "Both role variants extend the same base paragraph")
+assert_true(with_role.next_step == no_role.next_step and with_role.how_to_fix == no_role.how_to_fix,
+            "Role attachment changes only the impact text, not the fix command or fix detail")
+assert_true(missing_key.next_step == with_role.next_step.replace(" --region ap-south-1", ""),
+            "Missing role key and missing region only change the optional pieces, not the base command")
+
+print("\n=== EC2-32: full fix detail covers the real-world gotchas and avoids absolute claims ===")
+result = explain_finding(
+    f("EC2-32", resource_arn=EC2_ID, account_context="iam_role_attached=True, region=ap-south-1"),
+    client=ExplodingClient())
+for needle in ("MetadataNoToken", "AWS/EC2", "--http-put-response-hop-limit 2", "Terraform", "CloudFormation",
+               "http_tokens = \"required\"", "without a reboot", "--http-tokens optional"):
+    assert_true(needle in result.how_to_fix, f"EC2-32 how_to_fix mentions {needle!r}")
+all_ec2_text = " ".join((with_role.impact, no_role.impact, missing_key.impact,
+                         result.next_step, result.how_to_fix)).lower()
+for banned in ("no legitimate reason", "always", "never"):
+    assert_true(banned not in all_ec2_text, f"EC2-32 text avoids the absolute claim {banned!r}")
+assert_true("\u2014" not in all_ec2_text, "EC2-32 text contains no em dashes")
 
 print("\n=== Confidence/evidence are copied from the Finding, not decided by the template ===")
 finding = f("IAM-01", confidence="Likely — see note", evidence="Grant is scoped by a Condition block (aws:SourceIp)")

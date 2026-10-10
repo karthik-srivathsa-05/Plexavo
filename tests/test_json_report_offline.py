@@ -142,6 +142,41 @@ try:
 except (TypeError, ValueError) as e:
     assert_true(False, f"json.dumps raised: {e}")
 
+print("\n=== build_json_report: EC2-32 template explanation (AI narration off) is populated and explained ===")
+from plexavo.report.ai_narration import explain_finding
+
+EC2_ID = "i-0abc1234def567890"
+ec2_finding = Finding(
+    check_id="EC2-32", title="IMDSv2 Not Enforced", severity=Severity.CRITICAL, resource_arn=EC2_ID,
+    raw_detail="EC2 instance 'web' accepts IMDSv1.", account_context="iam_role_attached=True, region=ap-south-1",
+    confidence="Confirmed", evidence="http_tokens=optional, iam_role_attached=True",
+)
+ec2_expl = explain_finding(ec2_finding, use_ai=False)
+ec2_chain = AttackChain(chain_id="path-1", template="ec2-role-s3", nodes=[
+    ChainNode(kind="internet", title="Internet", detail="Unauthenticated, from anywhere", resource_id="internet"),
+    ChainNode(kind="ec2", title="EC2 instance", detail=f"{EC2_ID} - reachable", resource_id=EC2_ID,
+              finding_resource_arn=EC2_ID),
+])
+ec2_data = build_json_report([ec2_finding], calculate_score([ec2_finding]), "111111111111", [ec2_expl], chains=[ec2_chain])
+ec2_entry = ec2_data["findings"][0]
+ec2_cmd = f"aws ec2 modify-instance-metadata-options --instance-id {EC2_ID} --http-tokens required --http-endpoint enabled --region ap-south-1"
+assert_true(ec2_entry["explained"] is True, "EC2-32 entry has explained == true with AI narration off")
+assert_true(bool(ec2_entry["next_step"]) and bool(ec2_entry["how_to_fix"]), "EC2-32 entry has next_step and how_to_fix populated")
+assert_true(ec2_cmd in ec2_entry["next_step"] and ec2_cmd in ec2_entry["how_to_fix"],
+            "EC2-32 next_step and how_to_fix both carry the full command with the real instance id and region")
+assert_true(ec2_entry["severity"] == "Critical" and ec2_entry["evidence"] == "http_tokens=optional, iam_role_attached=True",
+            "Severity and evidence pass through unchanged")
+assert_true("account_context" not in ec2_entry, "account_context (and so the region) is not added to the JSON schema")
+ec2_important = ec2_data["important_findings"]
+assert_true(len(ec2_important) == 1 and ec2_important[0]["check_id"] == "EC2-32" and ec2_important[0]["explained"] is True
+            and ec2_cmd in ec2_important[0]["next_step"] and ec2_cmd in ec2_important[0]["how_to_fix"],
+            "important_findings carries the same populated EC2-32 fix")
+assert_true(set(ec2_entry) == set(data["findings"][0]), "EC2-32 entry has exactly the same keys as every other finding (schema unchanged)")
+try:
+    assert_true(json.loads(json.dumps(ec2_data)) == ec2_data, "EC2-32 report round-trips through JSON unchanged")
+except (TypeError, ValueError) as e:
+    assert_true(False, f"json.dumps raised: {e}")
+
 print("\n=== build_json_report: zero findings and zero chains ===")
 empty_data = build_json_report([], calculate_score([]), "111111111111", [], chains=[])
 assert_true(empty_data["findings"] == [] and empty_data["attack_chains"] == [] and empty_data["important_findings"] == [],
