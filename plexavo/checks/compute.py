@@ -18,6 +18,8 @@ gating it on network exposure the way NET-01/02/03 do would make it blind
 to the exact scenario it exists to catch.
 """
 
+from __future__ import annotations
+
 from plexavo.findings import Finding, Severity
 
 
@@ -51,7 +53,7 @@ def list_instances_with_metadata(ec2) -> list[dict]:
     return instances
 
 
-def check_32_imdsv2_not_enforced(instances: list[dict]) -> list[Finding]:
+def check_32_imdsv2_not_enforced(instances: list[dict], region: str | None = None) -> list[Finding]:
     """EC2-32: the instance's metadata service accepts unauthenticated
     IMDSv1 requests (HttpTokens != 'required') instead of requiring the
     session-token-authenticated IMDSv2.
@@ -74,6 +76,9 @@ def check_32_imdsv2_not_enforced(instances: list[dict]) -> list[Finding]:
       credential sitting behind this specific instance for IMDSv1 to hand
       over, so it doesn't get the same severity as the credential-theft
       case above."""
+    # `region` only feeds account_context, so the remediation template can
+    # print a correct `--region` flag. It never affects detection or severity.
+    account_context_suffix = f", region={region}" if region else ""
     findings = []
     for inst in instances:
         if inst["http_endpoint"] != "enabled":
@@ -104,7 +109,7 @@ def check_32_imdsv2_not_enforced(instances: list[dict]) -> list[Finding]:
             raw_detail=f"EC2 instance '{inst['name']}' ({inst['instance_id']}) accepts the "
                        f"legacy, unauthenticated IMDSv1 metadata requests instead of "
                        f"requiring IMDSv2's session token. {role_note}",
-            account_context=f"iam_role_attached={inst['has_role']}",
+            account_context=f"iam_role_attached={inst['has_role']}{account_context_suffix}",
             evidence=f"http_tokens={inst['http_tokens']}, iam_role_attached={inst['has_role']}",
         ))
     return findings
@@ -114,4 +119,4 @@ def run_all(session) -> list[Finding]:
     """Run EC2-32 against every running/pending instance in the account."""
     ec2 = session.client("ec2")
     instances = list_instances_with_metadata(ec2)
-    return check_32_imdsv2_not_enforced(instances)
+    return check_32_imdsv2_not_enforced(instances, region=session.region_name)

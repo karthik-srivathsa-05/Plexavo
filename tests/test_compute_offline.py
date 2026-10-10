@@ -108,5 +108,58 @@ assert_true(set(by_id) == {"i-b", "i-c"}, f"Only the two IMDSv1 instances produc
 assert_true(by_id["i-b"].severity.value == "Critical", "i-b (role attached) is Critical")
 assert_true(by_id["i-c"].severity.value == "Medium", "i-c (no role) is Medium")
 
+# === Region rides on account_context only; evidence, severity and detection are untouched ===
+print("\n=== Region is carried on account_context, not evidence ===")
+fleet = [
+    instance("i-r1", "with-role", http_tokens="optional", has_role=True),
+    instance("i-r2", "no-role", http_tokens="optional", has_role=False),
+    instance("i-r3", "hardened", http_tokens="required", has_role=True),
+]
+parsed = compute.list_instances_with_metadata(FakeEC2(fleet))
+without_region = compute.check_32_imdsv2_not_enforced(parsed)
+with_region = compute.check_32_imdsv2_not_enforced(parsed, region="ap-south-1")
+assert_true(len(without_region) == 2 and len(with_region) == 2, "Region does not change which instances are flagged")
+assert_true([f.resource_arn for f in with_region] == [f.resource_arn for f in without_region],
+            "Same instances flagged, same order, with and without a region")
+assert_true([f.severity for f in with_region] == [f.severity for f in without_region],
+            "Severity is identical with and without a region")
+assert_true(all(f.account_context.endswith(", region=ap-south-1") for f in with_region),
+            "region=ap-south-1 is appended to account_context when a region is passed")
+assert_true(with_region[0].account_context == "iam_role_attached=True, region=ap-south-1",
+            f"account_context keeps the existing key first (got: {with_region[0].account_context})")
+assert_true(with_region[1].account_context == "iam_role_attached=False, region=ap-south-1",
+            f"No-role account_context also gets the region (got: {with_region[1].account_context})")
+assert_true([f.evidence for f in with_region] == [f.evidence for f in without_region],
+            "evidence is byte-identical with and without a region")
+assert_true(with_region[0].evidence == "http_tokens=optional, iam_role_attached=True" and
+            "region" not in with_region[0].evidence,
+            f"evidence has no region in it (got: {with_region[0].evidence})")
+assert_true([f.raw_detail for f in with_region] == [f.raw_detail for f in without_region],
+            "raw_detail is unchanged by the region")
+assert_true(all("region" not in f.account_context for f in without_region)
+            and without_region[0].account_context == "iam_role_attached=True",
+            "No region passed -> account_context is exactly the old value")
+assert_true(all("region" not in f.account_context for f in compute.check_32_imdsv2_not_enforced(parsed, region=None)),
+            "region=None behaves like no region")
+assert_true(all("region" not in f.account_context for f in compute.check_32_imdsv2_not_enforced(parsed, region="")),
+            "An empty region string is treated as no region, not appended as 'region='")
+
+print("\n=== run_all passes the session's region through ===")
+class FakeSession:
+    def __init__(self, region_name):
+        self.region_name = region_name
+
+    def client(self, service):
+        assert service == "ec2", f"run_all should only build an ec2 client (got {service})"
+        return FakeEC2([instance("i-s1", "via-session", http_tokens="optional", has_role=True)])
+
+
+session_findings = compute.run_all(FakeSession("eu-west-1"))
+assert_true(len(session_findings) == 1 and session_findings[0].account_context == "iam_role_attached=True, region=eu-west-1",
+            f"run_all puts session.region_name into account_context (got: {[f.account_context for f in session_findings]})")
+session_findings = compute.run_all(FakeSession(None))
+assert_true(len(session_findings) == 1 and session_findings[0].account_context == "iam_role_attached=True",
+            "run_all with a region-less session leaves account_context unchanged")
+
 print(f"\n{'ALL PASSED' if failures == 0 else f'{failures} FAILURE(S)'}")
 sys.exit(1 if failures else 0)
