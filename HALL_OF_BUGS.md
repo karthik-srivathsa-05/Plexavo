@@ -52,7 +52,7 @@ another way. Severity stays Medium — unchanged — since the default
 still needs to warn the majority of users for whom this is a real gap.
 Found by: @dghah
 Category: Inaccurate Finding Language
-Fixed in: v0.2.8 (pending release)
+Fixed in: v0.2.8
 
 🏆 Bug #3
 One S3 bucket the scanning principal couldn't read (AccessDenied, e.g. an
@@ -63,7 +63,7 @@ Fixed by skipping the unreadable bucket per check and reporting it as
 unevaluated instead of raising.
 Found by: @fusiontechstrategies
 Category: Edge Case
-Fixed in: v0.4.6 (pending release)
+Fixed in: v0.4.7
 
 🏆 Bug #4
 IAM-05 and IAM-06 both missed an sts:AssumeRole grant scoped to
@@ -74,7 +74,7 @@ ARN wildcard matching, the same fix already shipped for the Action
 field in v0.4.5, now applied to Resource too.
 Found by: @fusiontechstrategies
 Category: False Negative
-Fixed in: v0.4.6 (pending release)
+Fixed in: v0.4.7
 
 🏆 Bug #5
 USE-26 flagged actively-used data-plane actions (s3:GetObject,
@@ -86,7 +86,7 @@ actions from consideration entirely, rather than confidently calling
 them unused.
 Found by: @fusiontechstrategies
 Category: False Positive
-Fixed in: v0.4.6 (pending release)
+Fixed in: v0.4.7
 
 🏆 Bug #6
 USE-27 flagged nearly every role as "never assumed," even roles used
@@ -96,7 +96,7 @@ fetching each role's data via get_role, the same fix already used
 elsewhere in this codebase for the same AWS quirk.
 Found by: @fusiontechstrategies
 Category: False Positive
-Fixed in: v0.4.6 (pending release)
+Fixed in: v0.4.7
 
 🏆 Bug #7
 STOR-20 flagged a Principal:* bucket policy as fully public even when a
@@ -107,4 +107,4 @@ already used, so a conditioned grant now reads High/"Likely — see note"
 instead of Critical/Confirmed.
 Found by: @fusiontechstrategies
 Category: False Positive
-Fixed in: v0.4.6 (pending release)
+Fixed in: v0.4.7
