@@ -226,15 +226,25 @@ def _run_scan_impl(args, json_mode: bool) -> None:
 
     with status if is_tty else nullcontext():
         stage("Enumerating IAM principals")
-        principals = list_all_principals(session)
+        # One set shared across the whole IAM stage: an object the scanning
+        # identity can't read is skipped rather than killing the scan, and
+        # every skip lands here so partial coverage is reported, never
+        # presented as a clean result.
+        iam_skipped: set = set()
+        principals = list_all_principals(session, iam_skipped)
         console.print(f"Found {len(principals)} principals ({sum(p.type == 'user' for p in principals)} users, "
                       f"{sum(p.type == 'role' for p in principals)} roles)\n")
 
         stage("Running checks IAM-01 through IAM-06")
-        findings = iam_checks.run_all(session, principals)
+        findings = iam_checks.run_all(session, principals, iam_skipped)
 
         stage("Running checks IAM-07 through IAM-14 (hygiene)")
-        findings += iam_hygiene.run_all(session, principals, account_id)
+        findings += iam_hygiene.run_all(session, principals, account_id, iam_skipped)
+        if iam_skipped:
+            console.print(f"[yellow]{len(iam_skipped)} IAM object(s) could not be read, so IAM coverage is "
+                           f"incomplete — treat their status as unknown, not confirmed safe:[/yellow]")
+            for note in sorted(iam_skipped):
+                console.print(f"[yellow]  - {note}[/yellow]")
 
         stage("Running checks NET-01 through NET-04")
         findings += network_checks.run_all(session)
@@ -251,7 +261,12 @@ def _run_scan_impl(args, json_mode: bool) -> None:
                            f"status as unknown, not confirmed safe: {', '.join(skipped_buckets)}[/yellow]")
 
         stage("Running checks ENC-29 through ENC-31")
-        findings += encryption_checks.run_all(session)
+        encryption_findings, enc_skipped_buckets = encryption_checks.run_all(session)
+        findings += encryption_findings
+        if enc_skipped_buckets:
+            console.print(f"[yellow]{len(enc_skipped_buckets)} bucket(s) could not be evaluated for "
+                           f"ENC-31 (AccessDenied) — treat their default-encryption status as "
+                           f"unknown, not confirmed safe: {', '.join(enc_skipped_buckets)}[/yellow]")
 
         stage("Running checks LOG-22 through LOG-25")
         findings += logging_checks.run_all(session)

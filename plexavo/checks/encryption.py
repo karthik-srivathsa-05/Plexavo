@@ -24,6 +24,8 @@ exception classes. Generic ClientError + error-code inspection used from
 the start this time.
 """
 
+from __future__ import annotations
+
 from botocore.exceptions import ClientError
 
 from plexavo.findings import Finding, Severity
@@ -79,16 +81,30 @@ def check_30_unencrypted_rds_instances(rds) -> list[Finding]:
     return findings
 
 
-def check_31_s3_missing_default_encryption(s3, bucket_names: list) -> list[Finding]:
+def check_31_s3_missing_default_encryption(s3, bucket_names: list, skipped: set | None = None) -> list[Finding]:
     """ENC-31: bucket has no default server-side encryption configuration.
-    See module docstring on why this may rarely fire on modern buckets."""
+    See module docstring on why this may rarely fire on modern buckets.
+
+    A bucket the caller's own principal can't read (AccessDenied, e.g. an
+    explicit Deny in that bucket's own policy) is skipped rather than
+    raised — one unreadable bucket used to crash the entire scan at the
+    encryption stage. Its name is added to `skipped` so the caller can
+    report it as unevaluated instead of silently dropping it from
+    coverage. Same pattern, same reason as STOR-19/20/21/22 in
+    storage.py; this check was the one per-bucket call left out of that
+    fix (Hall of Bugs)."""
     findings = []
     for name in bucket_names:
         try:
             s3.get_bucket_encryption(Bucket=name)
             continue  # has some encryption config, whatever it is
         except ClientError as e:
-            if e.response["Error"]["Code"] != "ServerSideEncryptionConfigurationNotFoundError":
+            code = e.response["Error"]["Code"]
+            if code == "AccessDenied":
+                if skipped is not None:
+                    skipped.add(name)
+                continue
+            if code != "ServerSideEncryptionConfigurationNotFoundError":
                 raise
         findings.append(Finding(
             check_id="ENC-31",
@@ -103,15 +119,23 @@ def check_31_s3_missing_default_encryption(s3, bucket_names: list) -> list[Findi
     return findings
 
 
-def run_all(session) -> list[Finding]:
-    """Run ENC-29 through ENC-31 against every relevant resource in the account."""
+def run_all(session) -> tuple[list[Finding], list[str]]:
+    """Run ENC-29 through ENC-31 against every relevant resource in the account.
+
+    Returns (findings, skipped_buckets): a bucket the caller's principal
+    can't read (AccessDenied on GetBucketEncryption) is skipped rather
+    than crashing the whole scan, and its name comes back in
+    skipped_buckets so the caller can report it as unevaluated instead of
+    silently under-reporting. Same contract as storage.run_all — see
+    check_31's docstring for why."""
     ec2 = session.client("ec2")
     rds = session.client("rds")
     s3 = session.client("s3")
     bucket_names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
 
+    skipped: set = set()
     findings = []
     findings += check_29_unencrypted_ebs_volumes(ec2)
     findings += check_30_unencrypted_rds_instances(rds)
-    findings += check_31_s3_missing_default_encryption(s3, bucket_names)
-    return findings
+    findings += check_31_s3_missing_default_encryption(s3, bucket_names, skipped)
+    return findings, sorted(skipped)

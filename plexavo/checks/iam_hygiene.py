@@ -34,12 +34,16 @@ are validated the same way:
   layer beyond the server-side filter.
 """
 
+from __future__ import annotations
+
 import json
 import re
 from datetime import datetime, timedelta, timezone
 
+from botocore.exceptions import ClientError
+
 from plexavo.findings import Finding, Severity
-from plexavo.principals import Principal, _normalize
+from plexavo.principals import Principal, _normalize, _is_skippable, _note_skip
 
 
 def _extract_account_ids(aws_principal_field) -> set:
@@ -117,11 +121,25 @@ def check_08_cross_account_external(principals: list[Principal], own_account_id:
     return findings
 
 
-def check_09_dormant_console_users(iam, users_raw: list, threshold_days: int = 90) -> list[Finding]:
+def check_09_dormant_console_users(iam, users_raw: list, threshold_days: int = 90,
+                                    skipped: set | None = None) -> list[Finding]:
     """IAM-09: console access enabled, but never used or unused for
     threshold_days+. threshold_days is parametrized specifically so
     ground truth can validate the comparison logic against a freshly
-    created identity — see module docstring."""
+    created identity — see module docstring.
+
+    NoSuchEntityException is the real "this user has no console password"
+    signal and stays load-bearing. Any other readable-object failure
+    (AccessDenied on GetLoginProfile, or the user being deleted mid-scan)
+    is skipped per-user and recorded in `skipped`, not raised: catching
+    only NoSuchEntityException meant one unreadable user took down the
+    whole scan — the same class of bug as the S3 AccessDenied crash in
+    storage.py (Hall of Bugs).
+
+    Ordering matters: in real boto3 NoSuchEntityException is itself a
+    ClientError subclass, so it has to be caught first or it would be
+    swallowed by the generic handler and misread as "unreadable" instead
+    of "no console access"."""
     findings = []
     now = datetime.now(timezone.utc)
     for u in users_raw:
@@ -130,6 +148,11 @@ def check_09_dormant_console_users(iam, users_raw: list, threshold_days: int = 9
             has_console_access = True
         except iam.exceptions.NoSuchEntityException:
             has_console_access = False
+        except ClientError as e:
+            if not _is_skippable(e):
+                raise
+            _note_skip(skipped, f"console access of user '{u['UserName']}'", e)
+            continue
         if not has_console_access:
             continue
 
@@ -157,8 +180,22 @@ def check_09_dormant_console_users(iam, users_raw: list, threshold_days: int = 9
     return findings
 
 
+def _access_keys_for(iam, user_name: str, skipped: set | None, label: str):
+    """list_access_keys for one user, or None if that single user can't be
+    read. Shared by IAM-10 and IAM-11 so one unreadable user costs only
+    that user, not the scan — same reasoning as check_09's docstring."""
+    try:
+        return iam.list_access_keys(UserName=user_name)["AccessKeyMetadata"]
+    except ClientError as e:
+        if not _is_skippable(e):
+            raise
+        _note_skip(skipped, f"{label} of user '{user_name}'", e)
+        return None
+
+
 def check_10_old_access_keys(
-    iam, users_raw: list, high_threshold_days: int = 90, critical_threshold_days: int = 180
+    iam, users_raw: list, high_threshold_days: int = 90, critical_threshold_days: int = 180,
+    skipped: set | None = None,
 ) -> list[Finding]:
     """IAM-10: active access key older than threshold. High at 90 days,
     Critical at 180, per the blueprint. Thresholds parametrized for the
@@ -166,7 +203,9 @@ def check_10_old_access_keys(
     findings = []
     now = datetime.now(timezone.utc)
     for u in users_raw:
-        keys = iam.list_access_keys(UserName=u["UserName"])["AccessKeyMetadata"]
+        keys = _access_keys_for(iam, u["UserName"], skipped, "access key age")
+        if keys is None:
+            continue
         for k in keys:
             if k.get("Status") != "Active":
                 continue
@@ -191,11 +230,13 @@ def check_10_old_access_keys(
     return findings
 
 
-def check_11_multiple_active_keys(iam, users_raw: list) -> list[Finding]:
+def check_11_multiple_active_keys(iam, users_raw: list, skipped: set | None = None) -> list[Finding]:
     """IAM-11: more than one active access key on a single user."""
     findings = []
     for u in users_raw:
-        keys = iam.list_access_keys(UserName=u["UserName"])["AccessKeyMetadata"]
+        keys = _access_keys_for(iam, u["UserName"], skipped, "access keys")
+        if keys is None:
+            continue
         active_keys = [k for k in keys if k.get("Status") == "Active"]
         if len(active_keys) > 1:
             key_ids = ", ".join(k["AccessKeyId"] for k in active_keys)
@@ -303,8 +344,21 @@ def check_14_lambda_admin_roles(lambda_client, principals: list[Principal]) -> l
     return findings
 
 
-def run_all(session, principals: list[Principal], own_account_id: str) -> list[Finding]:
-    """Run checks 7-14, all of them — IAM-12 is now built."""
+def run_all(session, principals: list[Principal], own_account_id: str,
+            skipped: set | None = None) -> list[Finding]:
+    """Run checks 7-14, all of them — IAM-12 is now built.
+
+    `skipped` collects per-user objects that couldn't be read, same
+    contract as principals.list_all_principals.
+
+    Scope note on what is NOT guarded here: checks 12, 13 and 14 each make
+    a single account-level call (cloudtrail:LookupEvents,
+    iam:GetAccountSummary, lambda:ListFunctions). An AccessDenied on one of
+    those means the entire check is unevaluable, not that one object out of
+    many is unreadable, so they are deliberately left to raise rather than
+    being quietly degraded into "no findings" — a different problem from the
+    per-object crash this parameter exists for, and one that deserves its
+    own decision about how to report a wholly-unrun check."""
     iam = session.client("iam")
     lambda_client = session.client("lambda")
     cloudtrail = session.client("cloudtrail")
@@ -317,9 +371,9 @@ def run_all(session, principals: list[Principal], own_account_id: str) -> list[F
     findings = []
     findings += check_07_cross_account_wildcard_trust(principals)
     findings += check_08_cross_account_external(principals, own_account_id)
-    findings += check_09_dormant_console_users(iam, users_raw)
-    findings += check_10_old_access_keys(iam, users_raw)
-    findings += check_11_multiple_active_keys(iam, users_raw)
+    findings += check_09_dormant_console_users(iam, users_raw, skipped=skipped)
+    findings += check_10_old_access_keys(iam, users_raw, skipped=skipped)
+    findings += check_11_multiple_active_keys(iam, users_raw, skipped=skipped)
     findings += check_12_root_account_usage(cloudtrail)
     findings += check_13_root_mfa(iam)
     findings += check_14_lambda_admin_roles(lambda_client, principals)

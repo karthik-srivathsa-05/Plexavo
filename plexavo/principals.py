@@ -28,7 +28,35 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from botocore.exceptions import ClientError
+
 from plexavo.findings import Severity
+
+# IAM errors that mean "this specific object can't be read right now",
+# not "the scan is broken": the scanning principal genuinely lacks read
+# access to one object (AccessDenied), or the object was deleted between
+# the list call that named it and the per-object fetch (NoSuchEntity — a
+# real race on any account that changes while a scan runs).
+#
+# Enumeration used to have no error handling at all, so either one took
+# down the entire scan at stage 1, before a single check ran — the same
+# class of bug as the S3 AccessDenied crash in storage.py (Hall of Bugs),
+# which is also where the "skip the object, record it, keep scanning"
+# shape used here comes from. Anything else still raises: an unexpected
+# IAM error must not be quietly turned into "no findings."
+_SKIPPABLE_IAM_ERROR_CODES = {"AccessDenied", "NoSuchEntity"}
+
+
+def _is_skippable(exc: ClientError) -> bool:
+    return exc.response.get("Error", {}).get("Code") in _SKIPPABLE_IAM_ERROR_CODES
+
+
+def _note_skip(skipped: set | None, label: str, exc: ClientError) -> None:
+    """Record that `label` could not be read, and why, so the caller can
+    report it as unevaluated instead of silently under-reporting."""
+    if skipped is not None:
+        code = exc.response.get("Error", {}).get("Code", "Unknown")
+        skipped.add(f"{label} ({code})")
 
 
 @dataclass
@@ -54,43 +82,96 @@ def _normalize(val):
     return val if isinstance(val, list) else [val]
 
 
-def _fetch_managed_policy_statements(iam, policy_arn: str) -> list:
-    version_id = iam.get_policy(PolicyArn=policy_arn)["Policy"]["DefaultVersionId"]
-    doc = iam.get_policy_version(PolicyArn=policy_arn, VersionId=version_id)["PolicyVersion"]["Document"]
+def _fetch_managed_policy_statements(iam, policy_arn: str, skipped: set | None = None) -> list:
+    try:
+        version_id = iam.get_policy(PolicyArn=policy_arn)["Policy"]["DefaultVersionId"]
+        doc = iam.get_policy_version(
+            PolicyArn=policy_arn, VersionId=version_id
+        )["PolicyVersion"]["Document"]
+    except ClientError as e:
+        if not _is_skippable(e):
+            raise
+        _note_skip(skipped, f"managed policy {policy_arn}", e)
+        return []
     return _normalize(doc.get("Statement"))
 
 
-def _policy_documents_for_user(iam, name: str) -> list:
+def _policy_documents_for_user(iam, name: str, skipped: set | None = None) -> list:
     docs = []
-    for p in iam.list_attached_user_policies(UserName=name)["AttachedPolicies"]:
-        docs.append((f"{p['PolicyName']} (direct)", _fetch_managed_policy_statements(iam, p["PolicyArn"])))
-    for name_ in iam.list_user_policies(UserName=name)["PolicyNames"]:
-        doc = iam.get_user_policy(UserName=name, PolicyName=name_)["PolicyDocument"]
+    try:
+        attached = iam.list_attached_user_policies(UserName=name)["AttachedPolicies"]
+        inline_names = iam.list_user_policies(UserName=name)["PolicyNames"]
+    except ClientError as e:
+        if not _is_skippable(e):
+            raise
+        _note_skip(skipped, f"policies of user '{name}'", e)
+        return docs
+    for p in attached:
+        docs.append((f"{p['PolicyName']} (direct)",
+                     _fetch_managed_policy_statements(iam, p["PolicyArn"], skipped)))
+    for name_ in inline_names:
+        try:
+            doc = iam.get_user_policy(UserName=name, PolicyName=name_)["PolicyDocument"]
+        except ClientError as e:
+            if not _is_skippable(e):
+                raise
+            _note_skip(skipped, f"inline policy '{name_}' on user '{name}'", e)
+            continue
         docs.append((f"{name_} (direct inline)", _normalize(doc.get("Statement"))))
     return docs
 
 
-def _policy_documents_for_group(iam, group_name: str) -> list:
+def _policy_documents_for_group(iam, group_name: str, skipped: set | None = None) -> list:
     docs = []
-    for p in iam.list_attached_group_policies(GroupName=group_name)["AttachedPolicies"]:
-        docs.append((f"{p['PolicyName']} (via group '{group_name}')", _fetch_managed_policy_statements(iam, p["PolicyArn"])))
-    for name_ in iam.list_group_policies(GroupName=group_name)["PolicyNames"]:
-        doc = iam.get_group_policy(GroupName=group_name, PolicyName=name_)["PolicyDocument"]
+    try:
+        attached = iam.list_attached_group_policies(GroupName=group_name)["AttachedPolicies"]
+        inline_names = iam.list_group_policies(GroupName=group_name)["PolicyNames"]
+    except ClientError as e:
+        if not _is_skippable(e):
+            raise
+        _note_skip(skipped, f"policies of group '{group_name}'", e)
+        return docs
+    for p in attached:
+        docs.append((f"{p['PolicyName']} (via group '{group_name}')",
+                     _fetch_managed_policy_statements(iam, p["PolicyArn"], skipped)))
+    for name_ in inline_names:
+        try:
+            doc = iam.get_group_policy(GroupName=group_name, PolicyName=name_)["PolicyDocument"]
+        except ClientError as e:
+            if not _is_skippable(e):
+                raise
+            _note_skip(skipped, f"inline policy '{name_}' on group '{group_name}'", e)
+            continue
         docs.append((f"{name_} (inline via group '{group_name}')", _normalize(doc.get("Statement"))))
     return docs
 
 
-def _policy_documents_for_role(iam, name: str) -> list:
+def _policy_documents_for_role(iam, name: str, skipped: set | None = None) -> list:
     docs = []
-    for p in iam.list_attached_role_policies(RoleName=name)["AttachedPolicies"]:
-        docs.append((f"{p['PolicyName']} (direct)", _fetch_managed_policy_statements(iam, p["PolicyArn"])))
-    for name_ in iam.list_role_policies(RoleName=name)["PolicyNames"]:
-        doc = iam.get_role_policy(RoleName=name, PolicyName=name_)["PolicyDocument"]
+    try:
+        attached = iam.list_attached_role_policies(RoleName=name)["AttachedPolicies"]
+        inline_names = iam.list_role_policies(RoleName=name)["PolicyNames"]
+    except ClientError as e:
+        if not _is_skippable(e):
+            raise
+        _note_skip(skipped, f"policies of role '{name}'", e)
+        return docs
+    for p in attached:
+        docs.append((f"{p['PolicyName']} (direct)",
+                     _fetch_managed_policy_statements(iam, p["PolicyArn"], skipped)))
+    for name_ in inline_names:
+        try:
+            doc = iam.get_role_policy(RoleName=name, PolicyName=name_)["PolicyDocument"]
+        except ClientError as e:
+            if not _is_skippable(e):
+                raise
+            _note_skip(skipped, f"inline policy '{name_}' on role '{name}'", e)
+            continue
         docs.append((f"{name_} (direct inline)", _normalize(doc.get("Statement"))))
     return docs
 
 
-def _permission_boundary(iam, boundary_field: dict | None) -> tuple[list, bool]:
+def _permission_boundary(iam, boundary_field: dict | None, skipped: set | None = None) -> tuple[list, bool]:
     """boundary_field is the raw 'PermissionsBoundary' dict from list_users/
     list_roles, or None. Returns ([(name, statements)], has_boundary)."""
     if not boundary_field:
@@ -98,26 +179,50 @@ def _permission_boundary(iam, boundary_field: dict | None) -> tuple[list, bool]:
     arn = boundary_field.get("PermissionsBoundaryArn")
     if not arn:
         return [], False
-    statements = _fetch_managed_policy_statements(iam, arn)
+    statements = _fetch_managed_policy_statements(iam, arn, skipped)
     return [(f"permission-boundary ({arn.split('/')[-1]})", statements)], True
 
 
-def list_all_principals(session) -> list[Principal]:
+def list_all_principals(session, skipped: set | None = None) -> list[Principal]:
     """Return every IAM user and role in the account with policies pre-loaded,
-    including group-inherited policies and permission boundaries."""
+    including group-inherited policies and permission boundaries.
+
+    A principal (or one policy document on it) the scanning identity can't
+    read is kept with whatever did load, rather than aborting the scan, and
+    a note naming it goes into `skipped` so the caller can report partial
+    coverage. See _SKIPPABLE_IAM_ERROR_CODES for why, and for why anything
+    other than AccessDenied/NoSuchEntity still raises.
+
+    A principal that lands in `skipped` is genuinely under-evaluated: its
+    unreadable policies produce no findings. That is reported, never
+    presented as a clean result."""
     iam = session.client("iam")
     principals: list[Principal] = []
 
     paginator = iam.get_paginator("list_users")
     for page in paginator.paginate():
         for u in page["Users"]:
-            policies = _policy_documents_for_user(iam, u["UserName"])
-            for group in iam.list_groups_for_user(UserName=u["UserName"])["Groups"]:
-                policies += _policy_documents_for_group(iam, group["GroupName"])
+            policies = _policy_documents_for_user(iam, u["UserName"], skipped)
+            try:
+                groups = iam.list_groups_for_user(UserName=u["UserName"])["Groups"]
+            except ClientError as e:
+                if not _is_skippable(e):
+                    raise
+                _note_skip(skipped, f"group memberships of user '{u['UserName']}'", e)
+                groups = []
+            for group in groups:
+                policies += _policy_documents_for_group(iam, group["GroupName"], skipped)
             # PermissionsBoundary from list_users has proven unreliable —
             # fetch via get_user instead, the documented-reliable path.
-            full_user = iam.get_user(UserName=u["UserName"])["User"]
-            boundary_stmts, has_boundary = _permission_boundary(iam, full_user.get("PermissionsBoundary"))
+            try:
+                full_user = iam.get_user(UserName=u["UserName"])["User"]
+            except ClientError as e:
+                if not _is_skippable(e):
+                    raise
+                _note_skip(skipped, f"permission boundary of user '{u['UserName']}'", e)
+                full_user = {}
+            boundary_stmts, has_boundary = _permission_boundary(
+                iam, full_user.get("PermissionsBoundary"), skipped)
             principals.append(Principal(
                 type="user",
                 name=u["UserName"],
@@ -133,13 +238,20 @@ def list_all_principals(session) -> list[Principal]:
             if "/aws-service-role/" in r["Arn"]:
                 continue
             # Same fix: get_role instead of trusting list_roles for this field.
-            full_role = iam.get_role(RoleName=r["RoleName"])["Role"]
-            boundary_stmts, has_boundary = _permission_boundary(iam, full_role.get("PermissionsBoundary"))
+            try:
+                full_role = iam.get_role(RoleName=r["RoleName"])["Role"]
+            except ClientError as e:
+                if not _is_skippable(e):
+                    raise
+                _note_skip(skipped, f"permission boundary of role '{r['RoleName']}'", e)
+                full_role = {}
+            boundary_stmts, has_boundary = _permission_boundary(
+                iam, full_role.get("PermissionsBoundary"), skipped)
             principals.append(Principal(
                 type="role",
                 name=r["RoleName"],
                 arn=r["Arn"],
-                policies=_policy_documents_for_role(iam, r["RoleName"]),
+                policies=_policy_documents_for_role(iam, r["RoleName"], skipped),
                 trust_policy=r.get("AssumeRolePolicyDocument"),
                 permission_boundary=boundary_stmts,
                 has_permission_boundary=has_boundary,
@@ -295,6 +407,24 @@ def resource_grants_any_role(statement: dict) -> bool:
     if resource_is_wildcard(statement):
         return True
     return any(r.endswith("role/*") for r in _normalize(statement.get("Resource")))
+
+
+def resource_grants_any_policy(statement: dict) -> bool:
+    """The managed-policy counterpart of resource_grants_any_role: does this
+    statement's Resource field cover EVERY managed policy in the account,
+    now or in the future — a bare "*", or an ARN pattern whose policy-name
+    segment is itself a bare wildcard (e.g.
+    "arn:aws:iam::123456789012:policy/*")?
+
+    Same deliberate narrowness: "policy/Billing*" only reaches policies
+    named Billing*, so it is NOT "any policy" and must go through the
+    per-policy path instead. Used by IAM-03, whose previous version
+    recognized only a literal "*" here and so silently missed the
+    ordinary "policy/*" form — the same prefix-wildcard blind spot
+    already fixed for sts:AssumeRole's Resource field."""
+    if resource_is_wildcard(statement):
+        return True
+    return any(r.endswith("policy/*") for r in _normalize(statement.get("Resource")))
 
 
 def action_within_boundary(principal: Principal, action: str, resource_arn: str | None) -> bool:

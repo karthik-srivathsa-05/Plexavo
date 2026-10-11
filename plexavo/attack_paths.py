@@ -56,6 +56,8 @@ from plexavo.principals import (
     action_within_boundary,
     statement_grants,
     resource_is_wildcard,
+    resource_includes,
+    _resource_pattern_matches,
 )
 from plexavo.checks.network import analyze_security_groups, ADMIN_PORTS, DATABASE_PORTS
 from plexavo.checks.iam import is_admin_equivalent
@@ -178,6 +180,32 @@ def _list_exposed_instances_with_role(ec2, iam) -> list[dict]:
     return results
 
 
+def _resource_reaches_bucket(resource_entry: str, bucket_arn: str) -> bool:
+    """Does one Resource entry grant access to this bucket or anything in
+    it? Two independent ways to match, both needed:
+
+    1. Literal prefix: the exact bucket ARN, or any key/sub-prefix under
+       it ("bucket/logs/*"). This is the original behaviour and is what
+       catches a grant scoped more narrowly than the whole bucket.
+    2. AWS wildcard semantics, via the same compiler every other resource
+       comparison uses: "arn:aws:s3:::*" (every bucket) and
+       "arn:aws:s3:::secrets*" (a bucket-name prefix) both reach this
+       bucket, and neither was matched before - an exact/startswith check
+       can't see them, so a role with s3:GetObject on every bucket in the
+       account produced no attack chain at all.
+
+    Known residual gap, deliberately not chased: a pattern with a wildcard
+    BEFORE the bucket-name boundary and literal text after it
+    ("arn:aws:s3:::*/logs/*") isn't matched, since deciding that needs
+    pattern-against-pattern intersection rather than pattern-against-ARN.
+    Rare, and the failure direction is a missed chain, never a fabricated
+    one."""
+    if resource_entry == bucket_arn or resource_entry.startswith(bucket_arn + "/"):
+        return True
+    return (_resource_pattern_matches(resource_entry, bucket_arn)
+            or _resource_pattern_matches(resource_entry, bucket_arn + "/"))
+
+
 def _role_s3_grants(principal: Principal, bucket_names: list[str]) -> list[tuple[str, set]]:
     """Buckets this role's own policies grant s3:GetObject/PutObject/
     DeleteObject on (directly, or via s3:*/Action:* wildcards -
@@ -185,11 +213,11 @@ def _role_s3_grants(principal: Principal, bucket_names: list[str]) -> list[tuple
     survive Deny/permission-boundary verification. Returns
     [(bucket_name, granted_actions)].
 
-    Resource matching is a deliberate prefix check against the bucket's
-    own ARN (exact bucket ARN, or anything under "bucket/") rather than
-    principals.resource_includes' exact-match - a policy scoped to a
-    sub-prefix or a specific key still genuinely grants access into this
-    bucket, and missing that would be a false negative on a real path.
+    Resource matching keeps the deliberate prefix behaviour (exact bucket
+    ARN, or anything under "bucket/") - a policy scoped to a sub-prefix or
+    a specific key still genuinely grants access into this bucket, and
+    missing that would be a false negative on a real path - and now also
+    resolves AWS wildcards, via _resource_reaches_bucket below.
     """
     grants: dict[str, set] = {}
     for _policy_name, statements in principal.policies:
@@ -204,7 +232,7 @@ def _role_s3_grants(principal: Principal, bucket_names: list[str]) -> list[tuple
             for bucket in bucket_names:
                 bucket_arn = f"arn:aws:s3:::{bucket}"
                 matches = is_wildcard or any(
-                    r == bucket_arn or r.startswith(bucket_arn + "/") for r in resources
+                    _resource_reaches_bucket(r, bucket_arn) for r in resources
                 )
                 if not matches:
                     continue
@@ -241,7 +269,17 @@ def _role_admin_assume_targets(principal: Principal, admin_roles: dict) -> list[
     mean the single most dangerous grant (assume ANY role) produces no
     chain while a narrower, less severe one does, which is exactly
     backwards for a feature whose job is showing real risk.
-    admin_roles is {role_arn: role_name}."""
+    admin_roles is {role_arn: role_name}.
+
+    Candidate targets come from resource_includes, NOT from intersecting
+    the raw Resource strings with the admin-role ARNs. That exact-string
+    intersection silently missed every prefix-wildcard form, so a role
+    granted sts:AssumeRole on "arn:aws:iam::123456789012:role/*" - assume
+    ANY role, the single most dangerous spelling of this grant - produced
+    no chain at all, while the exact-ARN spelling produced one. checks/
+    iam.py's IAM-05/IAM-06 had the same blind spot and were fixed (Hall of
+    Bugs); this module was missed by that pass and kept its own
+    exact-match copy."""
     targets = []
     for _policy_name, statements in principal.policies:
         for stmt in statements:
@@ -249,10 +287,9 @@ def _role_admin_assume_targets(principal: Principal, admin_roles: dict) -> list[
                 continue
             if not statement_grants(stmt, {"sts:AssumeRole"}):
                 continue
-            if resource_is_wildcard(stmt):
-                candidate_arns = set(admin_roles)
-            else:
-                candidate_arns = set(_normalize(stmt.get("Resource"))) & set(admin_roles)
+            candidate_arns = {
+                arn for arn in admin_roles if resource_includes(stmt, arn)
+            }
             for target_arn in sorted(candidate_arns):
                 if target_arn == principal.arn:
                     continue

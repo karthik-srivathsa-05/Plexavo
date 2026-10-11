@@ -33,14 +33,19 @@ v3 changes (Deny statements + permission boundaries):
 
 from __future__ import annotations
 
+from botocore.exceptions import ClientError
+
 from plexavo.findings import Finding, Severity
 from plexavo.principals import (
     Principal,
+    _is_skippable,
+    _note_skip,
     statement_grants,
     statement_has_wildcard_action,
     resource_is_wildcard,
     resource_includes,
     resource_grants_any_role,
+    resource_grants_any_policy,
     find_blocking_deny,
     has_full_wildcard_deny,
     action_within_boundary,
@@ -243,7 +248,18 @@ def check_02_self_escalation(principals: list[Principal]) -> list[Finding]:
 
 
 def check_03_create_policy_version(principals: list[Principal], all_managed_policy_owners: dict) -> list[Finding]:
-    """IAM-03: iam:CreatePolicyVersion on a managed policy this principal doesn't own."""
+    """IAM-03: iam:CreatePolicyVersion on a managed policy this principal doesn't own.
+
+    Resource matching goes through resource_grants_any_policy (the
+    "every policy" case) and resource_includes (a specific target),
+    NOT an exact ARN lookup in all_managed_policy_owners. The exact
+    lookup silently missed every prefix-wildcard form: a grant on
+    "arn:aws:iam::123456789012:policy/*" — rewrite ANY managed policy in
+    the account, i.e. full privilege escalation — produced no finding at
+    all, while the literal "*" spelling of the same grant did. Same
+    prefix-wildcard blind spot already fixed for IAM-05/IAM-06's
+    Resource field (Hall of Bugs); this check was missed by that pass.
+    """
     findings = []
     for p in principals:
         for policy_name, stmt in _all_statements(p):
@@ -254,7 +270,23 @@ def check_03_create_policy_version(principals: list[Principal], all_managed_poli
                 continue
             severity, confidence, evidence = _condition_adjustment(stmt)
 
-            if resource_is_wildcard(stmt):
+            # "Every policy" wording has to mean every policy in THIS
+            # account. A pattern like
+            # "arn:aws:iam::<other-account>:policy/*" ends with "policy/*"
+            # but reaches nothing here (IAM policies aren't cross-account
+            # addressable), so it must not claim account-wide rewrite
+            # access. When the owner map is empty — no customer-managed
+            # policies, or the list call was denied — a bare wildcard still
+            # fires, because it also covers policies created after this
+            # scan; same reasoning IAM-06 applies to future admin roles.
+            covers_local_policy = any(
+                resource_includes(stmt, arn) for arn in all_managed_policy_owners
+            )
+            grants_every_policy = resource_grants_any_policy(stmt) and (
+                covers_local_policy or not all_managed_policy_owners
+            )
+
+            if grants_every_policy:
                 result = _apply_deny_and_boundary(p, "iam:CreatePolicyVersion", None, severity, confidence, evidence)
                 if result is None:
                     continue
@@ -273,11 +305,18 @@ def check_03_create_policy_version(principals: list[Principal], all_managed_poli
                     evidence=evidence,
                 ))
             else:
-                for r in _normalize(stmt.get("Resource")):
-                    owner = all_managed_policy_owners.get(r)
+                # Iterate the known policies and ask whether this statement's
+                # Resource field covers each one (wildcards included), rather
+                # than looking the raw Resource strings up as exact keys.
+                # sorted() keeps finding order stable across runs — the dict
+                # comes from a paginated API, and set/dict ordering must not
+                # leak into report output.
+                for target_arn, owner in sorted(all_managed_policy_owners.items()):
                     if owner is None or owner == p.arn:
                         continue
-                    result = _apply_deny_and_boundary(p, "iam:CreatePolicyVersion", r, severity, confidence, evidence)
+                    if not resource_includes(stmt, target_arn):
+                        continue
+                    result = _apply_deny_and_boundary(p, "iam:CreatePolicyVersion", target_arn, severity, confidence, evidence)
                     if result is None:
                         continue
                     r_severity, r_confidence, r_evidence = result
@@ -287,7 +326,7 @@ def check_03_create_policy_version(principals: list[Principal], all_managed_poli
                         severity=r_severity,
                         resource_arn=p.arn,
                         raw_detail=f"Policy '{policy_name}' on {p.type} '{p.name}' "
-                                   f"grants iam:CreatePolicyVersion on '{r}', a policy "
+                                   f"grants iam:CreatePolicyVersion on '{target_arn}', a policy "
                                    f"it doesn't own. It can rewrite that policy to grant "
                                    f"broader access.",
                         account_context=f"policy={policy_name}",
@@ -447,21 +486,39 @@ def check_06_wildcard_assumerole(principals: list[Principal]) -> list[Finding]:
     return findings
 
 
-def run_all(session, principals: list[Principal]) -> list[Finding]:
-    """Run checks 1-6 and return the combined finding list."""
+def run_all(session, principals: list[Principal], skipped: set | None = None) -> list[Finding]:
+    """Run checks 1-6 and return the combined finding list.
+
+    `skipped` collects notes about anything that couldn't be read, same
+    contract as principals.list_all_principals: one AccessDenied on the
+    policy-owner enumeration used to abort the whole scan rather than
+    costing only the object it applies to."""
     iam = session.client("iam")
 
     policy_owners = {}
-    paginator = iam.get_paginator("list_policies")
-    for page in paginator.paginate(Scope="Local"):
-        for policy in page["Policies"]:
-            entities = iam.list_entities_for_policy(PolicyArn=policy["Arn"])
-            owner_arn = None
-            if entities["PolicyUsers"]:
-                owner_arn = f"arn:aws:iam::{policy['Arn'].split(':')[4]}:user/{entities['PolicyUsers'][0]['UserName']}"
-            elif entities["PolicyRoles"]:
-                owner_arn = f"arn:aws:iam::{policy['Arn'].split(':')[4]}:role/{entities['PolicyRoles'][0]['RoleName']}"
-            policy_owners[policy["Arn"]] = owner_arn
+    try:
+        paginator = iam.get_paginator("list_policies")
+        for page in paginator.paginate(Scope="Local"):
+            for policy in page["Policies"]:
+                try:
+                    entities = iam.list_entities_for_policy(PolicyArn=policy["Arn"])
+                except ClientError as e:
+                    if not _is_skippable(e):
+                        raise
+                    _note_skip(skipped, f"attachments of policy {policy['Arn']}", e)
+                    continue
+                owner_arn = None
+                if entities["PolicyUsers"]:
+                    owner_arn = f"arn:aws:iam::{policy['Arn'].split(':')[4]}:user/{entities['PolicyUsers'][0]['UserName']}"
+                elif entities["PolicyRoles"]:
+                    owner_arn = f"arn:aws:iam::{policy['Arn'].split(':')[4]}:role/{entities['PolicyRoles'][0]['RoleName']}"
+                policy_owners[policy["Arn"]] = owner_arn
+    except ClientError as e:
+        if not _is_skippable(e):
+            raise
+        # Without this map IAM-03's per-policy path has nothing to match
+        # against, so it under-reports. Recorded, not silently dropped.
+        _note_skip(skipped, "customer-managed policy list (IAM-03 coverage)", e)
 
     findings = []
     findings += check_01_wildcard_admin(principals)
