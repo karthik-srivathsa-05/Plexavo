@@ -22,6 +22,21 @@ ADMIN_PORTS = {
     5986: "WinRM (HTTPS)",
 }
 
+# AWS returns IpProtocol as either a protocol NAME ("tcp", "udp", "icmp",
+# "icmpv6") or an IANA protocol number as a string, per the EC2 API's own
+# IpPermission documentation — "-1" meaning every protocol. Every port in
+# ADMIN_PORTS and DATABASE_PORTS is a TCP service, so only TCP rules can
+# actually expose them; a UDP-only rule on port 22 reaches no SSH daemon.
+#
+# Both spellings of TCP are accepted deliberately. Observed AWS responses
+# use the name, and we have NOT confirmed against a live account whether
+# authorizing with IpProtocol="6" is normalized to "tcp" on the way back
+# out. If it is, the "6" branch is simply never taken; if it isn't,
+# accepting it is what prevents a silent false negative. Erring toward
+# treating an ambiguous value as TCP is the safe direction here — the
+# failure it guards against is missing a real exposure.
+TCP_PROTOCOLS = {"tcp", "6"}
+
 DATABASE_PORTS = {
     3306: "MySQL/MariaDB",
     5432: "PostgreSQL",
@@ -48,7 +63,8 @@ def _rule_is_open_to_internet(rule: dict) -> bool:
 
 def analyze_security_groups(ec2) -> dict:
     """sg_id -> {'name': str, 'open_ranges': [(from,to)], 'all_ports_open': bool,
-    'all_protocols': bool}
+    'all_protocols': bool, 'tcp_open_ranges': [(from,to)],
+    'all_tcp_ports_open': bool}
     open_ranges only includes port ranges reachable from 0.0.0.0/0 or ::/0 —
     internally-scoped rules (e.g. from another SG, or a specific office CIDR)
     are correctly excluded, same "don't overclaim" principle as everywhere else.
@@ -61,49 +77,85 @@ def analyze_security_groups(ec2) -> dict:
     was being described as "all ports and protocols," overclaiming
     protocol coverage (UDP/ICMP aren't touched by a TCP-scoped rule)
     even though the underlying finding (every TCP port reachable) is
-    still genuinely severe on its own."""
+    still genuinely severe on its own.
+
+    The 'tcp_*' pair is the protocol-filtered view of the same two facts,
+    and exists because IpProtocol used to be dropped entirely once a rule
+    passed the internet-reachability test: a UDP-only rule on port 22 was
+    reported as SSH exposure, and UDP 3306 as MySQL exposure, when
+    neither reaches a TCP service (Hall of Bugs). The checks that name a
+    specific TCP service — NET-01, NET-02, NET-04 — read the tcp_* keys.
+
+    The unfiltered 'open_ranges'/'all_ports_open' pair is kept
+    protocol-agnostic on purpose, NOT narrowed in place. NET-03 ("all
+    ports open") and attack_paths._exposure_detail both answer a
+    different question — is this instance reachable from the internet at
+    all — and a UDP-only exposure is a true answer to that question.
+    Narrowing the shared keys would have traded this false positive for a
+    false negative somewhere else."""
     result = {}
     paginator = ec2.get_paginator("describe_security_groups")
     for page in paginator.paginate():
         for sg in page["SecurityGroups"]:
             open_ranges = []
+            tcp_open_ranges = []
             all_open = False
             all_protocols = False
+            all_tcp_open = False
             for rule in sg.get("IpPermissions", []):
                 if not _rule_is_open_to_internet(rule):
                     continue
-                if rule.get("IpProtocol") == "-1":
+                protocol = str(rule.get("IpProtocol", "")).lower()
+                if protocol == "-1":
+                    # Every protocol on every port, so every TCP port too.
                     all_open = True
                     all_protocols = True
+                    all_tcp_open = True
                     continue
                 from_port = rule.get("FromPort")
                 to_port = rule.get("ToPort")
                 if from_port is None or to_port is None:
+                    # A protocol number outside tcp/udp/icmp/icmpv6 opens all
+                    # ports regardless of range, and AWS returns no port range
+                    # for it. Skipped as before: it is not TCP, so it cannot
+                    # expose any port in ADMIN_PORTS or DATABASE_PORTS.
                     continue
                 open_ranges.append((from_port, to_port))
-                if from_port == 0 and to_port == 65535:
+                full_range = from_port == 0 and to_port == 65535
+                if full_range:
                     all_open = True
+                if protocol in TCP_PROTOCOLS:
+                    tcp_open_ranges.append((from_port, to_port))
+                    if full_range:
+                        all_tcp_open = True
             result[sg["GroupId"]] = {
                 "name": sg.get("GroupName", sg["GroupId"]),
                 "open_ranges": open_ranges,
                 "all_ports_open": all_open,
                 "all_protocols": all_protocols,
+                "tcp_open_ranges": tcp_open_ranges,
+                "all_tcp_ports_open": all_tcp_open,
             }
     return result
 
 
 def _sg_open_ports(info: dict, port_labels: dict) -> dict:
-    """Which of port_labels {port: label} are open per this sg info."""
-    if info["all_ports_open"]:
+    """Which of port_labels {port: label} are open per this sg info.
+
+    TCP-only: every port in ADMIN_PORTS and DATABASE_PORTS names a TCP
+    service. See analyze_security_groups' docstring on the tcp_* keys."""
+    if info["all_tcp_ports_open"]:
         return dict(port_labels)
     return {p: label for p, label in port_labels.items()
-            if any(lo <= p <= hi for lo, hi in info["open_ranges"])}
+            if any(lo <= p <= hi for lo, hi in info["tcp_open_ranges"])}
 
 
 def _sg_allows_port(info: dict, port: int) -> bool:
-    if info["all_ports_open"]:
+    """TCP-only, same reason as _sg_open_ports — its one caller is NET-04
+    asking about an RDS endpoint port, which is always TCP."""
+    if info["all_tcp_ports_open"]:
         return True
-    return any(lo <= port <= hi for lo, hi in info["open_ranges"])
+    return any(lo <= port <= hi for lo, hi in info["tcp_open_ranges"])
 
 
 def list_public_instances(ec2) -> list:

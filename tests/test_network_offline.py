@@ -214,5 +214,77 @@ session = FakeSession(ec2=FakeEC2(sgs, []), rds=FakeRDS(db_instances))
 findings = net.check_net04_rds_publicly_accessible(session)
 assert_true(len(findings) == 0, "PubliclyAccessible=False doesn't fire even with a wide-open SG — RDS has no public endpoint to reach")
 
+print("\n=== REGRESSION: UDP-only rules must not fire NET-01/NET-02 — every port they name is a TCP service ===")
+# IpProtocol was dropped entirely once a rule passed the
+# internet-reachability test, so UDP 22 was reported as SSH exposure and
+# UDP 3306 as MySQL exposure. Neither reaches a TCP service.
+for port, expected_check, label in [(22, "NET-01", "SSH"), (3389, "NET-01", "RDP"),
+                                    (3306, "NET-02", "MySQL"), (5432, "NET-02", "PostgreSQL")]:
+    sgs = [sg(f"sg-udp-{port}", f"udp-{port}-open", [open_rule(port, port, "udp")])]
+    insts = [instance(f"i-udp-{port}", "udp-box", "1.2.3.9", [f"sg-udp-{port}"])]
+    findings = run_ec2_checks(sgs, insts)
+    assert_true(not any(f.check_id == expected_check for f in findings),
+                f"UDP-only port {port} does NOT fire {expected_check} ({label} is TCP)")
+
+print("\n=== FALSE NEGATIVE GUARD (inverse): the same ports on TCP still fire ===")
+for port, expected_check, label in [(22, "NET-01", "SSH"), (3389, "NET-01", "RDP"),
+                                    (3306, "NET-02", "MySQL"), (5432, "NET-02", "PostgreSQL")]:
+    sgs = [sg(f"sg-tcp-{port}", f"tcp-{port}-open", [open_rule(port, port, "tcp")])]
+    insts = [instance(f"i-tcp-{port}", "tcp-box", "1.2.3.10", [f"sg-tcp-{port}"])]
+    findings = run_ec2_checks(sgs, insts)
+    assert_true(any(f.check_id == expected_check for f in findings),
+                f"TCP port {port} still fires {expected_check} ({label}) — the fix didn't overcorrect")
+
+print("\n=== Numeric protocol '6' is TCP and still fires; '17' is UDP and must not ===")
+sgs = [sg("sg-proto6", "proto-6-ssh", [open_rule(22, 22, "6")])]
+insts = [instance("i-proto6", "proto6-box", "1.2.3.11", ["sg-proto6"])]
+findings = run_ec2_checks(sgs, insts)
+assert_true(any(f.check_id == "NET-01" for f in findings),
+            "IpProtocol='6' (IANA number for TCP) fires NET-01, so a non-normalized response can't hide a real exposure")
+sgs = [sg("sg-proto17", "proto-17-ssh", [open_rule(22, 22, "17")])]
+insts = [instance("i-proto17", "proto17-box", "1.2.3.12", ["sg-proto17"])]
+findings = run_ec2_checks(sgs, insts)
+assert_true(not any(f.check_id == "NET-01" for f in findings),
+            "IpProtocol='17' (IANA number for UDP) does NOT fire NET-01")
+
+print("\n=== Protocol=-1 still fires NET-01/02 — 'all protocols' includes TCP on every port ===")
+sgs = [sg("sg-minus1", "all-proto", [all_ports_rule()])]
+insts = [instance("i-minus1", "all-proto-box", "1.2.3.13", ["sg-minus1"])]
+findings = run_ec2_checks(sgs, insts)
+assert_true(any(f.check_id == "NET-01" for f in findings), "protocol=-1 still fires NET-01")
+assert_true(any(f.check_id == "NET-02" for f in findings), "protocol=-1 still fires NET-02")
+
+print("\n=== UNCHANGED BY DESIGN: a UDP-only full range still fires NET-03 (open question for the maintainer) ===")
+# Deliberately left as-is. NET-03 answers "is every port on this
+# instance reachable", which a UDP 0-65535 rule genuinely is for UDP.
+sgs = [sg("sg-udp-full", "udp-full-range", [open_rule(0, 65535, "udp")])]
+insts = [instance("i-udp-full", "udp-full-box", "1.2.3.14", ["sg-udp-full"])]
+findings = run_ec2_checks(sgs, insts)
+assert_true(any(f.check_id == "NET-03" for f in findings), "UDP-only full range still fires NET-03, unchanged")
+assert_true(not any(f.check_id in ("NET-01", "NET-02") for f in findings),
+            "but it no longer leaks into NET-01/NET-02 via the all-ports-open shortcut")
+
+print("\n=== REGRESSION: UDP-only rule on an RDS DB port must not fire NET-04 — RDS endpoints are TCP ===")
+sgs = [sg("sg-rds-udp", "rds-udp", [open_rule(3306, 3306, "udp")])]
+db_instances = [{
+    "DBInstanceIdentifier": "db-udp-only",
+    "Engine": "mysql",
+    "PubliclyAccessible": True,
+    "Endpoint": {"Port": 3306},
+    "DBInstanceArn": "arn:aws:rds:us-east-1:111111111111:db:db-udp-only",
+    "VpcSecurityGroups": [{"VpcSecurityGroupId": "sg-rds-udp", "Status": "active"}],
+}]
+session = FakeSession(ec2=FakeEC2(sgs, []), rds=FakeRDS(db_instances))
+findings = net.check_net04_rds_publicly_accessible(session)
+assert_true(len(findings) == 0, "NET-04 does not claim an RDS endpoint is reachable via a UDP-only rule")
+
+print("\n=== Protocol-agnostic exposure data is preserved for NET-03 and attack paths ===")
+ec2 = FakeEC2([sg("sg-udp-22", "udp-22", [open_rule(22, 22, "udp")])], [])
+info = net.analyze_security_groups(ec2)["sg-udp-22"]
+assert_true(info["open_ranges"] == [(22, 22)],
+            "open_ranges still records the UDP rule — the instance IS internet-reachable, just not on a TCP service")
+assert_true(info["tcp_open_ranges"] == [],
+            "tcp_open_ranges correctly excludes it, and that's what NET-01/02/04 read")
+
 print(f"\n{'ALL PASSED' if failures == 0 else f'{failures} FAILURE(S)'}")
 sys.exit(1 if failures else 0)
